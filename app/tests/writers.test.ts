@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'vitest';
-import { writeFileSync } from 'node:fs';
-import { writePes, writeDst, writeExp, normalize } from '../src/core/writers';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { describe, expect, it } from 'vitest';
 import type { StitchPlan, StitchPoint, Thread } from '../src/core/types';
+import { normalize, writeDst, writeExp, writePes } from '../src/core/writers';
 
 const threads: Thread[] = [
   { id: 'a', rgb: [0, 0, 0], pec: 20, name: 'Black' },
@@ -37,6 +37,7 @@ describe('writers', () => {
     const plan = samplePlan();
     const pes = writePes(plan, 'TEST');
     expect(String.fromCharCode(...pes.slice(0, 8))).toBe('#PES0001');
+    mkdirSync('tests/out', { recursive: true });
     writeFileSync('tests/out/sample.pes', pes);
     writeFileSync('tests/out/sample.dst', writeDst(plan, 'TEST'));
     writeFileSync('tests/out/sample.exp', writeExp(plan));
