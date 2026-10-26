@@ -1,0 +1,52 @@
+// End-to-end: open the app, load the example, digitize, visit every screen, export a .pes.
+const { chromium } = require('playwright');
+const fs = require('fs');
+(async () => {
+  const b = await chromium.launch();
+  const ctx = await b.newContext({ viewport: { width: 1440, height: 1000 }, acceptDownloads: true });
+  const p = await ctx.newPage();
+  const errors = [];
+  p.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
+  p.on('console', (m) => { if (m.type() === 'error') errors.push('console: ' + m.text()); });
+  await p.goto('http://localhost:4173/');
+  await p.waitForTimeout(2600);
+  await p.screenshot({ path: 'tests/out/s1-start.png', fullPage: true });
+  const m = await b.newPage({ viewport: { width: 390, height: 844 } });
+  await m.goto('http://localhost:4173/'); await m.waitForTimeout(1500);
+  await m.screenshot({ path: 'tests/out/m1-start.png', fullPage: true });
+  await m.close();
+  await p.getByRole('button', { name: 'Try the example shield' }).click();
+  await p.getByText("Let's set it up").waitFor();
+  await p.getByText(/We found \d+ colour/).waitFor({ timeout: 20000 });
+  await p.waitForTimeout(800);
+  await p.screenshot({ path: 'tests/out/s2-setup.png', fullPage: true });
+  await p.getByRole('button', { name: 'Digitize my design' }).click();
+  await p.getByRole('tablist', { name: 'View' }).waitFor({ timeout: 60000 });
+  await p.waitForTimeout(500);
+  await p.screenshot({ path: 'tests/out/s3-editor.png', fullPage: true });
+  // select an object via the sewing order, change it to fill
+  await p.locator('.seq-objs button:visible').first().click();
+  await p.getByRole('radio', { name: 'Fill' }).check();
+  await p.waitForTimeout(800);
+  await p.getByRole('tab', { name: 'Stitches' }).click();
+  await p.waitForTimeout(300);
+  await p.screenshot({ path: 'tests/out/s3b-editor-selected.png', fullPage: true });
+  await p.keyboard.press('Control+z');
+  await p.waitForTimeout(600);
+  await p.getByRole('button', { name: 'Sew preview' }).click();
+  await p.waitForTimeout(2500);
+  await p.screenshot({ path: 'tests/out/s4-sim.png', fullPage: true });
+  await p.getByRole('button', { name: 'Looks good, export' }).click();
+  await p.getByText(/Ready to sew|Almost ready/).waitFor();
+  await p.waitForTimeout(500);
+  await p.screenshot({ path: 'tests/out/s5-export.png', fullPage: true });
+  const [dl] = await Promise.all([p.waitForEvent('download'), p.getByRole('button', { name: 'Download' }).click()]);
+  await dl.saveAs('tests/out/e2e.pes');
+  // back to start: recent project listed
+  await p.getByRole('button', { name: /home/ }).click();
+  await p.waitForTimeout(1200);
+  await p.screenshot({ path: 'tests/out/s6-start-recent.png', fullPage: true });
+  console.log('download', dl.suggestedFilename(), fs.statSync('tests/out/e2e.pes').size, 'bytes');
+  console.log(errors.length ? errors.join('\n') : 'no console errors');
+  await b.close();
+})().catch((e) => { console.error(e); process.exit(1); });
