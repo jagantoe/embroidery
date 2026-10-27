@@ -204,7 +204,7 @@ function Properties({ obj }: { obj: DesignObject }) {
   const hide = () => { updateEdits((e) => ({ ...e, hidden: { ...e.hidden, [obj.id]: !obj.hidden } })); };
   const edited = !!project?.edits.params[obj.id];
   // density slider: 0 = lighter (wide spacing) … 100 = denser
-  const range = p.type === 'satin' ? [0.25, 0.6] : [0.3, 0.65];
+  const range = p.type === 'satin' ? [0.25, 0.6] : [0.18, 0.6];
   const density = Math.round(((range[1] - p.spacing) / (range[1] - range[0])) * 100);
 
   return (

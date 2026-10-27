@@ -84,3 +84,14 @@ Flag and report in a warnings panel (click to locate):
 | Density warnings | 0 at default settings |
 
 Benchmark set: the shield, lettering-only logos, a photo-like PNG (expect poor results and warn), thin-line art.
+
+## Additions after the hand-digitized comparison
+
+See [13](13-hand-digitized-comparison.md) for the reasoning.
+
+- **Patch border** (patch mode): the outer 3.5 mm of the design becomes a satin ring in the colour that forms most of the edge, sewn last.
+- **Layered fills**: after a first pass decides the sewing order, each fill colour is grown under thin colours sewn after it (morphological closing, 2 mm) and tucked 0.35 mm under neighbours (not under thin running lines). If the user reorders colours so a covering colour comes first, the shape falls back to its own pixels.
+- **Fill angle** 135° by default; spacing 0.25 mm, stitch length 4 mm.
+- **Satin**: stitch direction = shortest chord across the stroke; stitch positions keep the outer edge's density with shortened inner stitches; strokes with junctions are split into one column per direction; minimum column width 1.2 mm.
+- **Thin line webs** (many junctions, mean width < 1.6 mm) become triple-run lines.
+- **Travel routing** snaps needle points to the nearest allowed pixel and allows hidden routes up to 40 mm.

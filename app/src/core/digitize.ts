@@ -6,7 +6,7 @@ import {
   components, componentMask, distanceTransform, quantize, thin, traceSkeleton,
   type Component, type Mask,
 } from './raster';
-import { extendFreeEnds, fillBreaks, orderRuns, runningStitches, satinAlong, smooth, tatami, walkNetwork, type Pt, type Run } from './stitches';
+import { extendFreeEnds, fillBreaks, orderRuns, satinColumns, runningStitches, satinAlong, smooth, tatami, walkNetwork, type Pt, type Run } from './stitches';
 import type {
   DesignObject, DesignSettings, DigitizeResult, ObjectParams, PlanStats, RGB, StitchPlan, StitchPoint,
   StitchType, Thread, Warning,
@@ -30,22 +30,32 @@ export interface Analysis {
   index: Int16Array;
   comps: Component[];
   masks: Mask[];
+  /** for layered fills: the shape without the parts that run under later colours */
+  ownMasks: (Mask | null)[];
+  /** for layered fills: the colours a shape runs underneath */
+  under: number[][];
   dts: Float32Array[];
   objects: DesignObject[];
   autoAngle: number[];
   skeletons: Map<number, Pt[][]>;
   removedBackground: boolean;
+  /** palette index of the patch border, sewn last */
+  borderColour?: number;
 }
 
-const RUNNING_MAX_W = 1.0;
+const RUNNING_MAX_W = 1.2;
 const SATIN_MAX_W = 7.0;
+/** Satin narrower than this sews poorly; thin outlines are widened (hand digitizers do the same). */
+const SATIN_MIN_W = 1.2;
 
 export function fabricDefaults(settings: DesignSettings) {
   const base = {
-    woven: { fill: 0.4, satin: 0.4, pull: 0.2, len: 3.5 },
-    knit: { fill: 0.45, satin: 0.45, pull: 0.3, len: 3.5 },
-    towel: { fill: 0.38, satin: 0.38, pull: 0.3, len: 3.0 },
-    cap: { fill: 0.4, satin: 0.4, pull: 0.25, len: 3.5 },
+    // fill spacing follows Brother PE-Design's dense default (about 4 lines/mm) rather than the
+    // 0.4 mm industrial tatami default: hand-digitized Brother files look solid, not hatched
+    woven: { fill: 0.25, satin: 0.4, pull: 0.2, len: 4.0 },
+    knit: { fill: 0.3, satin: 0.45, pull: 0.3, len: 3.5 },
+    towel: { fill: 0.22, satin: 0.38, pull: 0.3, len: 3.5 },
+    cap: { fill: 0.25, satin: 0.4, pull: 0.25, len: 4.0 },
   }[settings.fabric];
   return { ...base, fill: base.fill + (settings.mode === 'onFabric' ? 0.05 : 0) };
 }
@@ -92,6 +102,61 @@ export function analyze(input: RasterInput, settings: DesignSettings): Analysis 
     removedBackground = comps.length < before;
   }
 
+  let borderColour = -1;
+  // Patch border: a dense satin edge around the outside, like hand-made patches. The outermost
+  // band of the design takes the colour that already forms most of the edge.
+  if (settings.mode === 'patch' && settings.border !== false) {
+    const band = (settings.borderMm ?? 3.5) * ppm;
+    const kept = new Uint8Array(w * h);
+    for (const c of comps) for (const p of c.pixels) kept[p] = 1;
+    // outside = not part of the design and reachable from the image edge
+    const outside = new Uint8Array(w * h);
+    const stack: number[] = [];
+    for (let x = 0; x < w; x++) { stack.push(x, (h - 1) * w + x); }
+    for (let y = 0; y < h; y++) { stack.push(y * w, y * w + w - 1); }
+    while (stack.length) {
+      const p = stack.pop()!;
+      if (outside[p] || kept[p]) continue;
+      outside[p] = 1;
+      const x = p % w, y = (p / w) | 0;
+      if (x > 0) stack.push(p - 1);
+      if (x < w - 1) stack.push(p + 1);
+      if (y > 0) stack.push(p - w);
+      if (y < h - 1) stack.push(p + w);
+    }
+    const notOutside = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) notOutside[i] = outside[i] ? 0 : 1;
+    // pixels touching the image edge count as edge too
+    const dist = distanceTransform({ data: notOutside, w, h, ox: 0, oy: 0 });
+    const edgeVotes = new Map<number, number>();
+    for (let i = 0; i < w * h; i++) {
+      const x = i % w, y = (i / w) | 0;
+      const dEdge = Math.min(dist[i], x + 1, y + 1, w - x, h - y);
+      if (kept[i] && dEdge <= 1.5) edgeVotes.set(q.index[i], (edgeVotes.get(q.index[i]) ?? 0) + 1);
+    }
+    let bv = 0;
+    edgeVotes.forEach((v, c) => { if (v > bv) { bv = v; borderColour = c; } });
+    if (borderColour >= 0) {
+      for (let i = 0; i < w * h; i++) {
+        if (!kept[i]) continue;
+        const x = i % w, y = (i / w) | 0;
+        const dEdge = Math.min(dist[i], x + 1, y + 1, w - x, h - y);
+        if (dEdge <= band) q.index[i] = borderColour;
+      }
+      // the border becomes its own shape (a satin ring), separate from inner lines of the same colour
+      const BORDER = 30000;
+      const tmp = q.index.slice();
+      for (let i = 0; i < w * h; i++) {
+        if (!kept[i]) continue;
+        const x = i % w, y = (i / w) | 0;
+        if (Math.min(dist[i], x + 1, y + 1, w - x, h - y) <= band) tmp[i] = BORDER;
+      }
+      comps = components(tmp, w, h, Math.max(4, Math.round(0.3 * ppm * ppm)))
+        .filter((c) => kept[c.pixels[0]] === 1) // background stays removed
+        .map((c) => (c.colour === BORDER ? { ...c, colour: borderColour } : c));
+    }
+  }
+
   // drop slivers: very thin bits smaller than 1.5 mm² (usually edge noise between two colours)
   comps = comps.filter((c) => {
     const area = c.pixels.length / (ppm * ppm);
@@ -103,57 +168,159 @@ export function analyze(input: RasterInput, settings: DesignSettings): Analysis 
     return (2 * maxDt) / ppm >= RUNNING_MAX_W;
   });
 
-  const masks: Mask[] = [];
-  const dts: Float32Array[] = [];
-  const objects: DesignObject[] = [];
-  const autoAngle: number[] = [];
-  const kindCount = new Map<string, number>();
-  comps.forEach((c, i) => {
-    const m = componentMask(c, w);
-    masks.push(m);
-    const dt = distanceTransform(m);
-    dts.push(dt);
-    let maxDt = 0;
-    for (let k = 0; k < dt.length; k++) if (dt[k] > maxDt) maxDt = dt[k];
-    const maxWidthMm = (2 * maxDt) / ppm;
-    let auto: StitchType = maxWidthMm < RUNNING_MAX_W ? 'running' : maxWidthMm <= SATIN_MAX_W ? 'satin' : 'fill';
-    if (auto === 'satin') {
-      // satin only suits stroke-like shapes of fairly even width: compare the mean
-      // width (area / centre-line length) with the widest point
-      const sk = thin(m);
-      let skPx = 0;
-      for (let k = 0; k < sk.length; k++) skPx += sk[k];
-      const meanW = c.pixels.length / Math.max(1, skPx) / ppm;
-      if (meanW < 0.5 * maxWidthMm && maxWidthMm >= 2.5) auto = 'fill';
-    }
-    const bbox: [number, number, number, number] = [c.bbox[0] / ppm, c.bbox[1] / ppm, (c.bbox[2] + 1) / ppm, (c.bbox[3] + 1) / ppm];
-    const inside = insideFn(m, ppm);
-    let angle = 45;
-    if (auto === 'fill') {
-      let best = Infinity;
-      for (const a of [45, 135, 0, 90, 30, 60, 120, 150]) {
-        const b = fillBreaks(inside, bbox, a, 1 / ppm);
-        if (b < best) { best = b; angle = a; }
+  const build = (list: Component[]) => {
+    const masks: Mask[] = [];
+    const ownMasks: (Mask | null)[] = [];
+    const dts: Float32Array[] = [];
+    const objects: DesignObject[] = [];
+    const autoAngle: number[] = [];
+    const kindCount = new Map<string, number>();
+    list.forEach((c, i) => {
+      const m = componentMask(c, w);
+      masks.push(m);
+      ownMasks.push(c.own ? componentMask({ ...c, pixels: c.own }, w) : null);
+      const dt = distanceTransform(m);
+      dts.push(dt);
+      let maxDt = 0;
+      for (let k = 0; k < dt.length; k++) if (dt[k] > maxDt) maxDt = dt[k];
+      const maxWidthMm = (2 * maxDt) / ppm;
+      let auto: StitchType = maxWidthMm < RUNNING_MAX_W ? 'running' : maxWidthMm <= SATIN_MAX_W ? 'satin' : 'fill';
+      if (auto === 'satin') {
+        // satin only suits stroke-like shapes of fairly even width: compare the mean
+        // width (area / centre-line length) with the widest point
+        const sk = thin(m);
+        let skPx = 0;
+        for (let k = 0; k < sk.length; k++) skPx += sk[k];
+        const meanW = c.pixels.length / Math.max(1, skPx) / ppm;
+        if (meanW < 0.5 * maxWidthMm && maxWidthMm >= 2.5 && meanW >= 1.8) auto = 'fill';
+        else if (meanW < 1.6) {
+          // a web of thin lines with many junctions (drawing detail) sews cleaner as a bold
+          // running stitch than as dozens of tiny crossing satin columns
+          const branches = traceSkeleton(sk, m.w, m.h, Math.max(3, maxDt * 1.8)).length;
+          const lengthMm = skPx / ppm;
+          if (branches >= 6 && lengthMm / branches < 8) auto = 'running';
+        }
       }
-    }
-    autoAngle.push(angle);
-    const colourName = nearestPec(q.palette[c.colour]).thread.name;
-    const kind = auto === 'fill' ? 'area' : auto === 'satin' ? 'column' : 'line';
-    const kk = `${colourName} ${kind}`;
-    kindCount.set(kk, (kindCount.get(kk) ?? 0) + 1);
-    objects.push({
-      id: `o${i}`,
-      name: `${kk} ${kindCount.get(kk)}`,
-      threadId: `t${c.colour}`,
-      pixelCount: c.pixels.length,
-      areaMm2: c.pixels.length / (ppm * ppm),
-      maxWidthMm,
-      bbox,
-      auto,
-      params: defaultParams(auto, angle, settings),
+      const bbox: [number, number, number, number] = [c.bbox[0] / ppm, c.bbox[1] / ppm, (c.bbox[2] + 1) / ppm, (c.bbox[3] + 1) / ppm];
+      const angle = auto === 'fill' ? chooseFillAngle(insideFn(m, ppm), bbox, 1 / ppm) : 135;
+      autoAngle.push(angle);
+      const colourName = nearestPec(q.palette[c.colour]).thread.name;
+      const kind = auto === 'fill' ? 'area' : auto === 'satin' ? 'column' : 'line';
+      const kk = `${colourName} ${kind}`;
+      kindCount.set(kk, (kindCount.get(kk) ?? 0) + 1);
+      objects.push({
+        id: `o${i}`,
+        name: `${kk} ${kindCount.get(kk)}`,
+        threadId: `t${c.colour}`,
+        pixelCount: (c.own ?? c.pixels).length,
+        areaMm2: (c.own ?? c.pixels).length / (ppm * ppm),
+        maxWidthMm,
+        bbox,
+        auto,
+        params: { ...defaultParams(auto, angle, settings), triple: auto === 'running' && maxWidthMm >= 0.9 },
+      });
     });
+    return { masks, ownMasks, dts, objects, autoAngle };
+  };
+
+  // First pass: each colour's own shapes. Used to decide the sewing order.
+  let built = build(comps);
+  const order = defaultColourOrder({ palette: q.palette, objects: built.objects, borderColour: borderColour >= 0 ? borderColour : undefined } as Analysis).map((id) => Number(id.slice(1)));
+
+  // Second pass — layering, like a hand digitizer: a fill colour continues underneath
+  // thin details of colours sewn after it (outlines, lettering, small lines) and tucks
+  // 0.35 mm under its neighbours, so the top colour covers seams instead of leaving gaps.
+  const layered = layerFills(comps, order, built.objects, q.index, w, h, ppm);
+  if (layered) {
+    comps = layered;
+    built = build(comps);
+  }
+  const { masks, ownMasks, dts, objects, autoAngle } = built;
+  const under = comps.map((c) => {
+    if (!c.own) return [];
+    const own = new Set(c.own);
+    const set = new Set<number>();
+    for (const p of c.pixels) if (!own.has(p) && q.index[p] >= 0) set.add(q.index[p]);
+    return [...set];
   });
-  return { w, h, ppm, palette: q.palette, index: q.index, comps, masks, dts, objects, autoAngle, skeletons: new Map(), removedBackground };
+  return { w, h, ppm, palette: q.palette, index: q.index, comps, masks, ownMasks, under, dts, objects, autoAngle, skeletons: new Map(), removedBackground, borderColour: borderColour >= 0 ? borderColour : undefined };
+}
+
+/**
+ * Prefer diagonal fills (135°, then 45°) like hand digitizers do: they hide row ends and
+ * pull less on straight edges. Only pick another angle when it splits the shape far less.
+ */
+/**
+ * One fill angle for the whole design (135°, the angle Brother's PE-Design and most hand
+ * digitizers use) keeps the sheen consistent across colours. Switch to 45° or an axis angle
+ * only when 135° would split the shape into many more pieces (more travel and trims).
+ */
+function chooseFillAngle(inside: (x: number, y: number) => boolean, bbox: [number, number, number, number], step: number) {
+  const b135 = fillBreaks(inside, bbox, 135, step), b45 = fillBreaks(inside, bbox, 45, step);
+  let angle = b135 > b45 * 2 + 4 ? 45 : 135;
+  const best = Math.min(b135, b45);
+  for (const a of [0, 90]) {
+    const b = fillBreaks(inside, bbox, a, step);
+    if (b * 3 + 4 < best) angle = a;
+  }
+  return angle;
+}
+
+function layerFills(comps: Component[], order: number[], objects: DesignObject[], index: Int16Array, w: number, h: number, ppm: number): Component[] | null {
+  const rank = new Map(order.map((c, i) => [c, i]));
+  const fillArea = new Map<number, number>(), area = new Map<number, number>();
+  comps.forEach((c, i) => {
+    area.set(c.colour, (area.get(c.colour) ?? 0) + c.pixels.length);
+    if (objects[i].auto === 'fill') fillArea.set(c.colour, (fillArea.get(c.colour) ?? 0) + c.pixels.length);
+  });
+  // which colour each kept pixel belongs to
+  const colourAt = new Int16Array(w * h).fill(-1);
+  const thinLine = new Uint8Array(w * h); // pixels of running-stitch details: too thin to hide a seam
+  comps.forEach((c, i) => {
+    const thin = objects[i].auto === 'running' ? 1 : 0;
+    for (const p of c.pixels) { colourAt[p] = c.colour; thinLine[p] = thin; }
+  });
+  const bridge = 2.0 * ppm, tuck = 0.35 * ppm;
+  let changed = false;
+  const out: Component[] = [];
+  const done = new Set<number>();
+  for (const c of order) {
+    const mine = comps.filter((x) => x.colour === c);
+    const r = rank.get(c)!;
+    if ((fillArea.get(c) ?? 0) < 0.5 * (area.get(c) ?? 1) || r === order.length - 1) { out.push(...mine); done.add(c); continue; }
+    const M = new Uint8Array(w * h);
+    for (const x of mine) for (const p of x.pixels) M[p] = 1;
+    // distance from every pixel to this colour
+    const notM = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) notM[i] = M[i] ? 0 : 1;
+    const toM = distanceTransform({ data: notM, w, h, ox: 0, oy: 0 });
+    const D = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) D[i] = toM[i] <= bridge ? 1 : 0;
+    const inD = distanceTransform({ data: D, w, h, ox: 0, oy: 0 }); // closing = erode(dilate(M))
+    const L = new Uint8Array(w * h);
+    let added = 0;
+    for (let i = 0; i < w * h; i++) {
+      if (M[i]) { L[i] = 1; continue; }
+      const col = colourAt[i];
+      if (col < 0 || (rank.get(col) ?? -1) <= r) continue;
+      // under a thin running line only fill gaps that this colour surrounds (closing);
+      // under satin and fills also tuck in along the edge
+      if (inD[i] > bridge || (!thinLine[i] && toM[i] <= tuck)) { L[i] = 1; added++; }
+    }
+    if (!added) { out.push(...mine); done.add(c); continue; }
+    changed = true;
+    const idx = new Int16Array(w * h).fill(-1);
+    for (let i = 0; i < w * h; i++) if (L[i]) idx[i] = 0;
+    const merged = components(idx, w, h, Math.max(4, Math.round(0.3 * ppm * ppm)));
+    for (const m of merged) {
+      const own = m.pixels.filter((p) => index[p] === c && M[p]);
+      if (!own.length) continue;
+      out.push({ ...m, colour: c, own: Int32Array.from(own) });
+    }
+    done.add(c);
+  }
+  for (const x of comps) if (!done.has(x.colour)) out.push(x);
+  return changed ? out : null;
 }
 
 function insideFn(m: Mask, ppm: number) {
@@ -219,6 +386,9 @@ export function defaultColourOrder(a: Analysis): string[] {
   return stats
     .filter((s) => s.total > 0)
     .sort((x, y) => {
+      // the patch border goes on last so it covers every edge
+      const bx = x.id === `t${a.borderColour}` ? 1 : 0, by = y.id === `t${a.borderColour}` ? 1 : 0;
+      if (bx !== by) return bx - by;
       const fx = x.fill / x.total >= 0.5 ? 1 : 0, fy = y.fill / y.total >= 0.5 ? 1 : 0;
       if (fx !== fy) return fy - fx;
       return y.total - x.total;
@@ -239,14 +409,15 @@ export function plan(a: Analysis, settings: DesignSettings, edits: Edits): Digit
     return px >= 0 && py >= 0 && px < a.w && py < a.h && a.index[py * a.w + px] >= 0;
   };
 
-  const objects = a.objects.map((o, i) => ({ ...o, params: { ...defaultParams(o.auto, a.autoAngle[i], settings), ...(edits.params[o.id] ?? {}) }, hidden: !!edits.hidden[o.id] }));
+  const objects = a.objects.map((o, i) => ({ ...o, params: { ...defaultParams(o.auto, a.autoAngle[i], settings), triple: o.params.triple, ...(edits.params[o.id] ?? {}) }, hidden: !!edits.hidden[o.id] }));
 
   const out: StitchPoint[] = [];
   const ranges: Record<string, [number, number]> = {};
   const sewnThreads: Thread[] = [];
   let pos: Pt | null = null;
   let trims = 0, jumpsMm = 0;
-  const maxTravel = 15;
+  const maxTravel = 15;  // straight hidden travel
+  const maxRoute = 40;   // travel routed around obstacles, still hidden under later stitching
 
   const stitchTo = (p: Pt) => { out.push({ x: p[0], y: p[1], cmd: 'stitch' }); pos = p; };
   const tieAt = (p: Pt, toward: Pt | null) => {
@@ -285,7 +456,7 @@ export function plan(a: Analysis, settings: DesignSettings, edits: Edits): Digit
     labelRank[i + 1] = o.hidden || !t || t.skip ? -1 : order.indexOf(o.threadId);
   });
   const labelsRaster = new Int32Array(a.w * a.h);
-  a.comps.forEach((c, i) => { for (const px of c.pixels) labelsRaster[px] = i + 1; });
+  a.comps.forEach((c, i) => { for (const px of c.own ?? c.pixels) labelsRaster[px] = i + 1; });
   let currentRank = 0;
   const travelOk = (from: Pt, to: Pt) => {
     const d = d2(from, to);
@@ -306,9 +477,19 @@ export function plan(a: Analysis, settings: DesignSettings, edits: Edits): Digit
     const x0 = Math.max(0, Math.floor(Math.min(from[0], to[0]) * ppm - margin)), y0 = Math.max(0, Math.floor(Math.min(from[1], to[1]) * ppm - margin));
     const x1 = Math.min(a.w - 1, Math.ceil(Math.max(from[0], to[0]) * ppm + margin)), y1 = Math.min(a.h - 1, Math.ceil(Math.max(from[1], to[1]) * ppm + margin));
     const W = x1 - x0 + 1, H = y1 - y0 + 1;
-    if (W * H > 400000) return null;
-    const sx = Math.floor(from[0] * ppm) - x0, sy = Math.floor(from[1] * ppm) - y0;
-    const tx = Math.floor(to[0] * ppm) - x0, ty = Math.floor(to[1] * ppm) - y0;
+    if (W * H > 3000000) return null;
+    // needle points sit on (or just outside) shape edges: snap them onto the nearest allowed pixel
+    const snap = (p: Pt): [number, number] | null => {
+      const cx = Math.floor(p[0] * ppm), cy = Math.floor(p[1] * ppm);
+      for (let r = 0; r <= 4; r++) for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        if (allowedPx(cx + dx, cy + dy)) return [cx + dx - x0, cy + dy - y0];
+      }
+      return null;
+    };
+    const s0 = snap(from), t0 = snap(to);
+    if (!s0 || !t0) return null;
+    const [sx, sy] = s0, [tx, ty] = t0;
     if (sx < 0 || sy < 0 || sx >= W || sy >= H || tx < 0 || ty < 0 || tx >= W || ty >= H) return null;
     const prev = new Int32Array(W * H).fill(-1);
     const q = new Int32Array(W * H);
@@ -339,7 +520,7 @@ export function plan(a: Analysis, settings: DesignSettings, edits: Edits): Digit
     simple[0] = from; simple[simple.length - 1] = to;
     let len = 0;
     for (let i = 1; i < simple.length; i++) len += d2(simple[i - 1], simple[i]);
-    return len <= maxTravel * 1.5 ? simple : null;
+    return len <= maxRoute ? simple : null;
   };
   const connect = (to: Pt, next: Pt | null, _inside: ((x: number, y: number) => boolean) | null) => {
     if (!pos) { trimAndJump(to, next); return; }
@@ -347,7 +528,7 @@ export function plan(a: Analysis, settings: DesignSettings, edits: Edits): Digit
     if (d < 0.05) return;
     let path: Pt[] | null = null;
     if (d <= 1.0 || travelOk(pos, to)) path = [pos, to];
-    else if (d <= maxTravel) path = route(pos, to);
+    else if (d <= maxRoute) path = route(pos, to);
     if (path) {
       for (let k = 1; k < path.length; k++) {
         const from: Pt = path[k - 1], dest = path[k];
@@ -396,8 +577,12 @@ export function plan(a: Analysis, settings: DesignSettings, edits: Edits): Digit
       });
       const { o, i } = remaining.splice(bi, 1)[0];
       const start = out.length;
-      const runs = generate(a, i, o.params, pos ?? cursor, anyOpaque, step);
-      const inside = o.params.type === 'running' ? null : insideFn(a.masks[i], ppm);
+      // a layered fill may only run under colours that really are sewn later
+      const rankOf = (col: number) => { const t = threads[col]; return t?.skip ? -1 : order.indexOf(`t${col}`); };
+      const layeredOk = a.under[i].every((col) => rankOf(col) > currentRank);
+      const mask = layeredOk || !a.ownMasks[i] ? a.masks[i] : a.ownMasks[i]!;
+      const runs = generate(a, i, o.params, pos ?? cursor, anyOpaque, step, mask);
+      const inside = o.params.type === 'running' ? null : insideFn(mask, ppm);
       sewRuns(runs, inside);
       ranges[o.id] = [start, out.length];
       cursor = pos;
@@ -425,6 +610,15 @@ export function plan(a: Analysis, settings: DesignSettings, edits: Edits): Digit
   };
 }
 
+function countJunctions(lines: Pt[][]): number {
+  const key = (p: Pt) => `${Math.round(p[0] * 20)},${Math.round(p[1] * 20)}`;
+  const deg = new Map<string, number>();
+  for (const l of lines) for (const p of [l[0], l[l.length - 1]]) deg.set(key(p), (deg.get(key(p)) ?? 0) + 1);
+  let n = 0;
+  deg.forEach((d) => { if (d >= 3) n++; });
+  return n;
+}
+
 /** Douglas–Peucker polyline simplification. */
 function simplify(pts: Pt[], tol: number): Pt[] {
   if (pts.length < 3) return pts.slice();
@@ -445,9 +639,9 @@ function simplify(pts: Pt[], tol: number): Pt[] {
   return pts.filter((_, k) => keep[k]);
 }
 
-function generate(a: Analysis, i: number, p: ObjectParams, from: Pt | null, anyOpaque: (x: number, y: number) => boolean, step: number): Run[] {
+function generate(a: Analysis, i: number, p: ObjectParams, from: Pt | null, anyOpaque: (x: number, y: number) => boolean, step: number, mask: Mask): Run[] {
   const o = a.objects[i];
-  const inside = insideFn(a.masks[i], a.ppm);
+  const inside = insideFn(mask, a.ppm);
   if (p.type === 'fill') {
     const runs: Run[] = [];
     if (p.underlay) {
@@ -461,9 +655,15 @@ function generate(a: Analysis, i: number, p: ObjectParams, from: Pt | null, anyO
   }
   const lines = skeletonOf(a, i);
   if (p.type === 'satin') {
+    // strokes that meet at junctions (most letters) are split into one column per stroke direction;
+    // simple strokes and loops follow their centre-line
+    const junctions = countJunctions(lines);
+    if (junctions >= 1) {
+      return orderRuns(satinColumns(inside, o.bbox, { spacing: p.spacing, pullComp: p.pullComp, maxWidth: o.maxWidthMm, step: 0.5 / a.ppm, underlay: p.underlay }), from);
+    }
     const runs = lines.filter((l) => l.length >= 2).map((l) => satinAlong(l, inside, {
       halfWidthAt: halfWidthFn(a, i),
-      spacing: p.spacing, pullComp: p.pullComp, maxHalfWidth: 8, step: 0.5 / a.ppm, underlay: p.underlay,
+      spacing: p.spacing, pullComp: p.pullComp, minWidth: SATIN_MIN_W, maxHalfWidth: 8, step: 0.5 / a.ppm, underlay: p.underlay,
     }));
     return orderRuns(runs, from);
   }
@@ -494,7 +694,7 @@ function buildWarnings(a: Analysis, settings: DesignSettings, objects: (DesignOb
   const w: Warning[] = [];
   const thin = objects.filter((o) => o.auto === 'running' && o.params.type === 'running' && !o.hidden);
   if (thin.length) {
-    w.push({ id: 'thin', level: 'info', text: `${thin.length} detail${thin.length > 1 ? 's are' : ' is'} thinner than 1 mm, so ${thin.length > 1 ? 'they are' : 'it is'} sewn as running stitch. Make the design bigger to get satin.`, objectId: thin[0].id });
+    w.push({ id: 'thin', level: 'info', text: `${thin.length} detail${thin.length > 1 ? 's are' : ' is'} thinner than 1.2 mm, so ${thin.length > 1 ? 'they are' : 'it is'} sewn as running stitch. Make the design bigger to get satin.`, objectId: thin[0].id });
   }
   for (const t of threads) {
     if (t.skip) continue;

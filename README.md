@@ -53,6 +53,7 @@ The build is plain static files and is deployed to GitHub Pages by [`.github/wor
 | 10 | [Roadmap](docs/10-roadmap.md) | Phases and gates |
 | 11 | [Libraries, prior art and risks](docs/11-libraries-and-risks.md) | What to reuse, what can go wrong |
 | 12 | [Motion and transitions](docs/12-motion-and-transitions.md) | Thread motifs, animations, View Transitions |
+| 13 | [Hand-digitized comparison](docs/13-hand-digitized-comparison.md) | Auto output vs. a hand-digitized file, what changed, remaining gaps |
 
 ## Key facts
 

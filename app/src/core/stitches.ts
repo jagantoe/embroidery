@@ -185,6 +185,8 @@ export interface SatinOptions {
   halfWidthAt: (p: Pt) => number;
   spacing: number;
   pullComp: number;
+  /** narrowest column (mm) — thinner outlines are widened to this */
+  minWidth: number;
   maxHalfWidth: number;
   step: number;
   underlay: boolean;
@@ -196,44 +198,102 @@ export interface SatinOptions {
  * The centre-line is first sewn as an underlay run, then the satin comes back.
  */
 export function satinAlong(center: Pt[], inside: InsideFn, o: SatinOptions): Run {
-  const path = resample(center, Math.max(0.1, o.spacing / 2));
-  if (path.length < 2) return [];
-  const edgeDist = (p: Pt, n: Pt) => {
+  // sample the centre-line finely; the stitch positions are picked from these samples below
+  const fine = resample(center, 0.05);
+  if (fine.length < 2) return [];
+  const ray = (p: Pt, n: Pt, limit: number) => {
     let d = 0;
-    // never reach further than the local width allows: stops rays shooting along a stroke at ends and junctions
-    const limit = Math.min(o.maxHalfWidth, o.halfWidthAt(p) * 1.3 + 0.25);
     while (d < limit && inside(p[0] + n[0] * (d + o.step), p[1] + n[1] * (d + o.step))) d += o.step;
     return d;
   };
-  const zig: Pt[] = [];
-  for (let i = 0; i < path.length; i++) {
-    // tangent over a window that scales with the column width, so pixel noise in the centre-line doesn't fan the stitches
-    const win = Math.max(3, Math.ceil((Math.max(0.6, o.halfWidthAt(path[i])) * 1.6) / Math.max(0.1, o.spacing / 2)));
-    const a = path[Math.max(0, i - win)], b = path[Math.min(path.length - 1, i + win)];
-    let tx = b[0] - a[0], ty = b[1] - a[1];
-    const tl = Math.hypot(tx, ty) || 1;
-    tx /= tl; ty /= tl;
-    const n: Pt = [-ty, tx];
-    const p = path[i];
-    const dl = edgeDist(p, n) + o.pullComp, dr = edgeDist(p, [-n[0], -n[1]]) + o.pullComp;
+  const sampleEvery = Math.max(1, Math.round(0.15 / 0.05));
+  // 1. a stitch direction per sample: the shortest chord through the point, searched within
+  //    ±60° of the centre-line normal. Hand digitizers set such "direction lines" so stitches
+  //    cross a stroke at right angles instead of fanning on curves and at corners.
+  const raw: Pt[] = [];
+  for (let i = 0; i < fine.length; i += sampleEvery) {
+    const p = fine[i];
+    const hw = o.halfWidthAt(p);
+    const win = Math.max(6, Math.ceil((Math.max(0.6, hw) * 1.6) / 0.05));
+    const a = fine[Math.max(0, i - win)], b = fine[Math.min(fine.length - 1, i + win)];
+    const base = Math.atan2(b[1] - a[1], b[0] - a[0]) + Math.PI / 2;
+    const limit = Math.min(o.maxHalfWidth, hw * 2.5 + 0.5);
+    let best = base, bestLen = Infinity;
+    for (let k = -10; k <= 10; k++) {
+      const t = base + (k * Math.PI) / 30;
+      const n: Pt = [Math.cos(t), Math.sin(t)];
+      const len = ray(p, n, limit) + ray(p, [-n[0], -n[1]], limit) + Math.abs(k) * 0.004; // slight bias to the normal
+      if (len < bestLen) { bestLen = len; best = t; }
+    }
+    raw.push([Math.cos(best), Math.sin(best)]);
+  }
+  const dirAt = (i: number): Pt => {
+    // smoothed direction, interpolated from the coarse samples
+    const c = Math.min(raw.length - 1, Math.floor(i / sampleEvery));
+    const ref = raw[c];
+    let sx = 0, sy = 0;
+    for (let j = Math.max(0, c - 3); j <= Math.min(raw.length - 1, c + 3); j++) {
+      const e = raw[j];
+      const sgn = e[0] * ref[0] + e[1] * ref[1] < 0 ? -1 : 1;
+      sx += e[0] * sgn; sy += e[1] * sgn;
+    }
+    const l = Math.hypot(sx, sy) || 1;
+    return [sx / l, sy / l];
+  };
+  // 2. chords (left, right edge points) at every fine sample, with a consistent "left" side
+  const chords: [Pt, Pt][] = [];
+  let prevN: Pt | null = null;
+  for (let i = 0; i < fine.length; i++) {
+    const p = fine[i];
+    let n = dirAt(i);
+    if (prevN && n[0] * prevN[0] + n[1] * prevN[1] < 0) n = [-n[0], -n[1]];
+    prevN = n;
+    const hw = o.halfWidthAt(p);
+    const fromEnd = Math.min(i, fine.length - 1 - i) * 0.05;
+    // near the ends of a column the shape narrows: be strict there so stitches don't fan out
+    const limit = Math.min(o.maxHalfWidth, fromEnd < hw * 1.5 ? hw * 1.05 + 0.1 : hw * 1.3 + 0.25);
+    let dl = ray(p, n, limit), dr = ray(p, [-n[0], -n[1]], limit);
     if (dl + dr < 0.35) continue;
-    const left: Pt = [p[0] + n[0] * dl, p[1] + n[1] * dl];
-    const right: Pt = [p[0] - n[0] * dr, p[1] - n[1] * dr];
-    const next = i % 2 === 0 ? left : right;
+    // thin outlines are widened to the minimum width a satin sews cleanly at
+    if (dl + dr < o.minWidth) { const extra = (o.minWidth - dl - dr) / 2; dl += extra; dr += extra; }
+    dl += o.pullComp; dr += o.pullComp;
+    chords.push([[p[0] + n[0] * dl, p[1] + n[1] * dl], [p[0] - n[0] * dr, p[1] - n[1] * dr]]);
+  }
+  if (!chords.length) return [];
+  // 3. pick chords so the *outer* edge of a curve keeps the requested density; the inner edge
+  //    gets closer stitches, which are shortened alternately (the "short stitch" technique)
+  const half = Math.max(0.08, o.spacing / 2);
+  const picked: [Pt, Pt][] = [chords[0]];
+  for (const c of chords) {
+    const last = picked[picked.length - 1];
+    const adv = Math.max(Math.hypot(c[0][0] - last[0][0], c[0][1] - last[0][1]), Math.hypot(c[1][0] - last[1][0], c[1][1] - last[1][1]));
+    if (adv >= half) picked.push(c);
+  }
+  const zig: Pt[] = [];
+  picked.forEach((c, k) => {
+    let [l, r] = c;
+    if (k > 0 && k % 2 === 0) {
+      const pc = picked[k - 1];
+      const advL = Math.hypot(l[0] - pc[0][0], l[1] - pc[0][1]), advR = Math.hypot(r[0] - pc[1][0], r[1] - pc[1][1]);
+      const mx = (l[0] + r[0]) / 2, my = (l[1] + r[1]) / 2;
+      if (advL < half * 0.4) l = [l[0] + (mx - l[0]) * 0.35, l[1] + (my - l[1]) * 0.35];
+      if (advR < half * 0.4) r = [r[0] + (mx - r[0]) * 0.35, r[1] + (my - r[1]) * 0.35];
+    }
+    const next = k % 2 === 0 ? l : r;
     // skip a stitch that would cross over empty fabric (e.g. across the gap inside a letter)
     const prev = zig[zig.length - 1];
     if (prev) {
       let outside = 0;
-      for (let k = 1; k < 8; k++) {
-        const t = k / 8;
+      for (let q = 1; q < 8; q++) {
+        const t = q / 8;
         if (!inside(prev[0] + (next[0] - prev[0]) * t, prev[1] + (next[1] - prev[1]) * t)) outside++;
       }
-      if (outside > 2) continue;
+      if (outside > 3) return;
     }
     zig.push(next);
-  }
+  });
   if (!o.underlay) return zig;
-  const under = runningStitches(path, 2.0, false);
+  const under = runningStitches(resample(center, 0.5), 2.0, false);
   return [...under, ...zig.reverse()];
 }
 
@@ -340,4 +400,123 @@ export function walkNetwork(lines: Pt[][], from: Pt | null): Pt[][] {
     cur = path[path.length - 1];
   }
   return paths;
+}
+
+export interface ColumnOptions {
+  spacing: number;
+  pullComp: number;
+  maxWidth: number;   // widest stroke (mm), bounds the chord search
+  step: number;
+  underlay: boolean;
+}
+
+/**
+ * Satin for strokes that meet at junctions (letters like A, E, K…): split the shape into
+ * regions of one stroke direction and sew each as a satin column whose stitches cross the
+ * stroke at that angle. This is what a hand digitizer does by drawing one column per stroke.
+ */
+export function satinColumns(inside: InsideFn, bbox: [number, number, number, number], o: ColumnOptions): Run[] {
+  const g = 0.2;
+  const gw = Math.ceil((bbox[2] - bbox[0]) / g) + 1, gh = Math.ceil((bbox[3] - bbox[1]) / g) + 1;
+  const BINS = 12;
+  const bin = new Int8Array(gw * gh).fill(-1);
+  const limit = o.maxWidth * 1.5 + 1;
+  const ray = (x: number, y: number, dx: number, dy: number) => {
+    let d = 0;
+    while (d < limit && inside(x + dx * (d + o.step * 2), y + dy * (d + o.step * 2))) d += o.step * 2;
+    return d;
+  };
+  // 1. stitch direction per grid cell = direction of the shortest chord through it
+  for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+    const x = bbox[0] + i * g, y = bbox[1] + j * g;
+    if (!inside(x, y)) continue;
+    let best = 0, bl = Infinity;
+    for (let b = 0; b < BINS; b++) {
+      const t = (b * Math.PI) / BINS, dx = Math.cos(t), dy = Math.sin(t);
+      const l = ray(x, y, dx, dy) + ray(x, y, -dx, -dy);
+      if (l < bl) { bl = l; best = b; }
+    }
+    bin[j * gw + i] = best;
+  }
+  // 2. majority smoothing (circular bins)
+  for (let pass = 0; pass < 2; pass++) {
+    const copy = bin.slice();
+    for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+      const k = j * gw + i;
+      if (copy[k] < 0) continue;
+      const votes = new Array(BINS).fill(0);
+      for (let dj = -2; dj <= 2; dj++) for (let di = -2; di <= 2; di++) {
+        const ii = i + di, jj = j + dj;
+        if (ii < 0 || jj < 0 || ii >= gw || jj >= gh) continue;
+        const v = copy[jj * gw + ii];
+        if (v >= 0) { votes[v] += 2; votes[(v + 1) % BINS] += 1; votes[(v + BINS - 1) % BINS] += 1; }
+      }
+      let bb = copy[k], bv = -1;
+      votes.forEach((v, b) => { if (v > bv) { bv = v; bb = b; } });
+      bin[k] = bb;
+    }
+  }
+  // 3. regions: connected cells of one direction; tiny regions join their biggest neighbour
+  const region = new Int32Array(gw * gh).fill(-1);
+  const regions: { bin: number; cells: number[] }[] = [];
+  for (let k = 0; k < gw * gh; k++) {
+    if (bin[k] < 0 || region[k] >= 0) continue;
+    const id = regions.length, cells: number[] = [k];
+    region[k] = id;
+    for (let q = 0; q < cells.length; q++) {
+      const c = cells[q], ci = c % gw, cj = (c / gw) | 0;
+      for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const ii = ci + di, jj = cj + dj;
+        if (ii < 0 || jj < 0 || ii >= gw || jj >= gh) continue;
+        const n = jj * gw + ii;
+        if (region[n] < 0 && bin[n] === bin[k]) { region[n] = id; cells.push(n); }
+      }
+    }
+    regions.push({ bin: bin[k], cells });
+  }
+  const minCells = Math.max(12, (1.2 / g) ** 2);
+  for (let pass = 0; pass < 3; pass++) {
+    regions.forEach((r, id) => {
+      if (!r.cells.length || r.cells.length >= minCells) return;
+      const contact = new Map<number, number>();
+      for (const c of r.cells) {
+        const ci = c % gw, cj = (c / gw) | 0;
+        for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const ii = ci + di, jj = cj + dj;
+          if (ii < 0 || jj < 0 || ii >= gw || jj >= gh) continue;
+          const n = region[jj * gw + ii];
+          if (n >= 0 && n !== id) contact.set(n, (contact.get(n) ?? 0) + 1);
+        }
+      }
+      let target = -1, tv = 0;
+      contact.forEach((v, n) => { if (v > tv) { tv = v; target = n; } });
+      if (target < 0) return;
+      for (const c of r.cells) region[c] = target;
+      regions[target].cells.push(...r.cells);
+      r.cells = [];
+    });
+  }
+  // 4. one satin column per region: rows across the stroke, one stitch per row
+  const runs: Run[] = [];
+  regions.forEach((r, id) => {
+    if (!r.cells.length) return;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const c of r.cells) {
+      const x = bbox[0] + (c % gw) * g, y = bbox[1] + ((c / gw) | 0) * g;
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+    }
+    const rb: [number, number, number, number] = [x0 - g, y0 - g, x1 + g, y1 + g];
+    const inRegion: InsideFn = (x, y) => {
+      if (!inside(x, y)) return false;
+      const i = Math.round((x - bbox[0]) / g), j = Math.round((y - bbox[1]) / g);
+      if (i < 0 || j < 0 || i >= gw || j >= gh) return false;
+      return region[j * gw + i] === id;
+    };
+    const angle = (r.bin * 180) / BINS;
+    if (o.underlay) {
+      runs.push(...tatami(inRegion, rb, { angle, spacing: 1.0, length: 7, inset: 0.3, extend: 0, step: o.step, canExtend: inRegion }));
+    }
+    runs.push(...tatami(inRegion, rb, { angle, spacing: o.spacing / 2, length: 7, inset: 0, extend: o.pullComp, step: o.step, canExtend: inside }));
+  });
+  return runs;
 }

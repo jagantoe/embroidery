@@ -143,6 +143,8 @@ function despeckle(index: Int16Array, w: number, h: number, minPx: number) {
 export interface Component {
   colour: number;
   pixels: Int32Array;
+  /** layered fills: the pixels that really are this colour (the rest runs under later colours) */
+  own?: Int32Array;
   bbox: [number, number, number, number]; // x0,y0,x1,y1 inclusive (px)
 }
 

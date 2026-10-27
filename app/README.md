@@ -31,6 +31,8 @@ npm test           # unit tests (writers, digitizer)
 
 ### Verified
 
+- Benchmarked against a hand-digitized Brother file of the same design: see `docs/13-hand-digitized-comparison.md` and `tests/compare_pes.py`.
+
 - `tests/golden.py`: our `.pes` header and stitch data are **byte-identical** to pyembroidery's PES v1 writer for the same stitches (only the 1-bit thumbnails differ by a few pixels); `.pes`, `.dst` and `.exp` read back with pyembroidery give the exact stitch list.
 - `tests/e2e.cjs` (Playwright): example → setup → digitize → edit → simulator → export → download; no console errors.
 - Example: the Flanders coat of arms (see `docs/05-example-flanders.md`).
@@ -39,8 +41,9 @@ npm test           # unit tests (writers, digitizer)
 
 ## Known limitations / next steps
 
-- **Lettering**: satin on thick letters can fan out on tight curves. Switch such shapes to *Fill* in the editor for now. Proper fix: rail-based satin (split strokes at corners, Ink/Stitch-style).
-- **Trims**: small separate details (claws, fine outlines, letters) still need many trims. On machines without an automatic cutter that means snipping jump threads. Next: smarter object order (nearest entry point instead of nearest centre) and running travel along already-planned outlines.
+- **Lettering**: letters with junctions (A, R, T…) are split into one satin column per stroke direction and are still rougher than hand-digitized lettering; letters made of strokes meeting at sharp corners can show a stray stitch. Next: proper rail-based satin from the vector outline.
+- **Raster pipeline**: SVGs are rasterised before digitizing, so edges are only as precise as the work raster (0.1 mm). Using the SVG paths directly would give crisper outlines.
+- **Trims**: on the shield benchmark the auto result now needs about as many trims as a hand-digitized version (≈25 vs 29); designs with many separate small details still need one trim per detail.
 - **Manual drawing tools** from `docs/08-manual-editor.md` (draw satin/running/fill, node edit, knife, stitch-level edits) are not built yet; editing is per detected shape.
 - PES v6 (exact thread RGB), JEF export, lettering engine: later phases.
 - Photos give poor results by nature; the app works best with logos and clip art.

@@ -80,6 +80,10 @@ export interface DesignSettings {
   fabric: FabricPreset;
   mode: OutputMode;
   maxColours: number;
+  /** patch mode: satin border around the outside edge (default on) */
+  border?: boolean;
+  /** border width in mm (default 3.5) */
+  borderMm?: number;
 }
 
 export interface DigitizeResult {

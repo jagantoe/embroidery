@@ -173,7 +173,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (!p) return p;
       const next = { ...p, settings: { ...p.settings, ...patch }, updated: Date.now() };
       // size or colour count changes need a fresh analysis; other settings only re-plan
-      const needsAnalysis = 'widthMm' in patch || 'heightMm' in patch || 'maxColours' in patch;
+      const needsAnalysis = 'widthMm' in patch || 'heightMm' in patch || 'maxColours' in patch || 'border' in patch || 'borderMm' in patch || 'mode' in patch;
       if (needsAnalysis) { analysedFor.current = null; next.digitized = false; }
       else if (analysedFor.current) runPlan(next);
       return next;

@@ -138,7 +138,7 @@ export function Setup() {
             </div>
             <p className="muted" style={{ marginTop: 10, fontSize: 15 }}>
               {fits ? 'Fits with a 3 mm safety margin.' : `Too big for the ${hoop.label} hoop. Use "Fit to hoop" or pick a bigger hoop.`}
-              {' '}Lines thinner than 1 mm at this size are sewn as simple running stitch.
+              {' '}Lines thinner than 1.2 mm at this size are sewn as running stitch.
             </p>
           </fieldset>
 
@@ -147,7 +147,7 @@ export function Setup() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10 }}>
               <label className="choice teal">
                 <input type="radio" name="mode" checked={s.mode === 'patch'} onChange={() => updateSettings({ mode: 'patch' })} style={{ accentColor: 'var(--teal)' }} />
-                <span><strong style={{ fontFamily: 'var(--font-display)', fontSize: 19, fontWeight: 600 }}>A patch</strong><br /><span className="muted" style={{ fontSize: 14 }}>Every colour is stitched</span></span>
+                <span><strong style={{ fontFamily: 'var(--font-display)', fontSize: 19, fontWeight: 600 }}>A patch</strong><br /><span className="muted" style={{ fontSize: 14 }}>Every colour is stitched, with a border to cut around</span></span>
               </label>
               <label className="choice teal">
                 <input type="radio" name="mode" checked={s.mode === 'onFabric'} onChange={() => updateSettings({ mode: 'onFabric' })} style={{ accentColor: 'var(--teal)' }} />
@@ -155,6 +155,17 @@ export function Setup() {
               </label>
             </div>
           </fieldset>
+
+          {s.mode === 'patch' && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '8px 16px', marginTop: -12 }}>
+              <label className="check"><input type="checkbox" checked={s.border !== false} onChange={(e) => updateSettings({ border: e.target.checked })} />Satin border around the edge</label>
+              {s.border !== false && (
+                <label className="field small" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>Width
+                  <input className="input" type="number" min={1.5} max={6} step={0.5} value={s.borderMm ?? 3.5} style={{ width: 84 }} onChange={(e) => updateSettings({ borderMm: Number(e.target.value) })} /> mm
+                </label>
+              )}
+            </div>
+          )}
 
           <fieldset>
             <legend className="legend-lg">What fabric?</legend>
